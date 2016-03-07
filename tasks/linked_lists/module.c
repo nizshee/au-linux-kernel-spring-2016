@@ -15,7 +15,7 @@ static void __init test_stack(void)
     const char* test_data[] = { "1", "2", "3", "4" };
     long i = 0;
 
-    pr_alert("Testing basic stack");
+    pr_alert("Testing basic stack\n");
 
     for (i = 0; i != ARRAY_SIZE(test_data); ++i) {
         stack_push(&data_stack,
@@ -36,12 +36,29 @@ static void __init test_stack(void)
 
 static void __init print_processes_backwards(void)
 {
-    // TODO
+    LIST_HEAD(data_stack);
+    struct task_struct *task;
+    stack_entry_t *tos;
+    char* p;
+    for_each_process(task) {
+        p = kmalloc(1024 * sizeof(char), GFP_KERNEL);
+        get_task_comm(p, task);
+        stack_push(&data_stack, create_stack_entry((void*)p));
+        // printk("%s => %s\n", task->comm, get_task_comm(buffer, task));
+    }
+
+    for(; !stack_empty(&data_stack);) {
+        tos = stack_pop(&data_stack);
+        p = STACK_ENTRY_DATA(tos, char*);
+        printk("%s\n", p);
+        kfree(p);
+        delete_stack_entry(tos);
+    }
 }
 
 static int __init ll_init(void)
 {
-    printk(KERN_ALERT "Hello, linked_lists\n");
+    printk(KERN_ALERT "Hello, linked_lists11\n");
     test_stack();
     print_processes_backwards();
     return 0;
