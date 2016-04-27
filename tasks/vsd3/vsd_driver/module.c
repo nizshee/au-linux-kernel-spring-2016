@@ -66,8 +66,8 @@ static int vsd_dev_release(struct inode *inode, struct file *filp)
 
 static void vsd_dev_dma_op_complete_tsk_func(unsigned long unused)
 {
-    (void)unused;
     // TODO wakeup task waiting for completion of VSD cmd
+    wake_up(&vsd_dev->dma_op_compete_wq);
 }
 
 static ssize_t vsd_dev_read(struct file *filp,
@@ -78,18 +78,24 @@ static ssize_t vsd_dev_read(struct file *filp,
 
     print_vsd_dev_hw_regs(vsd_dev);
 
-    if (vsd_dev->hwregs->cmd != VSD_CMD_NONE) {
+    if (vsd_dev->hwregs->cmd != VSD_CMD_NONE) { // no need because of mutex
         ret = -EBUSY;
         goto exit;
     }
 
     // TODO check not to alloc too much DMA memory (easy DDOS)
+    if (read_size > 4 * PAGE_SIZE) {
+        ret = -ENOMEM;
+        goto exit;
+    }
+
     kdma_buf = kzalloc(read_size, GFP_KERNEL);
     if (!kdma_buf) {
         ret = -ENOMEM;
         goto exit;
     }
 
+    mutex_lock(&vsd_dev->dev_ops_serialization_mutex);
     vsd_dev->hwregs->result = 0;
     vsd_dev->hwregs->tasklet_vaddr =
         (uint64_t)&vsd_dev->dma_op_complete_tsk;
@@ -104,15 +110,18 @@ static ssize_t vsd_dev_read(struct file *filp,
      * wait_event call to wait_event_interruptible call.
      * Describe sequence of events (step by step) that lead to
      * write to freed kernel buffer in vsd_* kernel code.
-     * 1. TODO
-     * 2. TODO
-     * 3. TODO
-     * ...
+     * 1. wait_event_interruptible
+     * 2. interrupt
+     * 3. kfree
+     * 4. allocation of freed buffer in any part of kernel 
+     * 5. vsd_dev_read from device memcpy to someones memory
      */
     wait_event(vsd_dev->dma_op_compete_wq,
             vsd_dev->hwregs->cmd == VSD_CMD_NONE);
 
     ret = vsd_dev->hwregs->result;
+    mutex_unlock(&vsd_dev->dev_ops_serialization_mutex);
+
     if (ret)
         goto exit_free_dma;
 
@@ -139,12 +148,17 @@ static ssize_t vsd_dev_write(struct file *filp,
     void *kdma_buf = NULL;
 
     print_vsd_dev_hw_regs(vsd_dev);
-    if (vsd_dev->hwregs->cmd != VSD_CMD_NONE) {
+    if (vsd_dev->hwregs->cmd != VSD_CMD_NONE) { // no need because of mutex
         ret = -EBUSY;
         goto exit;
     }
 
     // TODO check not to alloc too much DMA memory (easy DDOS)
+    if (write_size > 4 * PAGE_SIZE) {
+        ret = -ENOMEM;
+        goto exit;
+    }
+
     kdma_buf = kzalloc(write_size, GFP_KERNEL);
     if (!kdma_buf) {
         ret = -ENOMEM;
@@ -156,6 +170,7 @@ static ssize_t vsd_dev_write(struct file *filp,
         goto exit_free_dma;
     }
 
+    mutex_lock(&vsd_dev->dev_ops_serialization_mutex);
     vsd_dev->hwregs->result = 0;
     vsd_dev->hwregs->tasklet_vaddr =
         (uint64_t)&vsd_dev->dma_op_complete_tsk;
@@ -169,6 +184,8 @@ static ssize_t vsd_dev_write(struct file *filp,
             vsd_dev->hwregs->cmd == VSD_CMD_NONE);
 
     ret = vsd_dev->hwregs->result;
+    mutex_unlock(&vsd_dev->dev_ops_serialization_mutex);
+
     if (ret)
         goto exit_free_dma;
 
@@ -187,6 +204,7 @@ static loff_t vsd_dev_llseek(struct file *filp, loff_t off, int whence)
 {
     loff_t newpos = 0;
 
+    mutex_lock(&vsd_dev->dev_ops_serialization_mutex);
     switch(whence) {
         case SEEK_SET:
             newpos = off;
@@ -200,9 +218,10 @@ static loff_t vsd_dev_llseek(struct file *filp, loff_t off, int whence)
         default: /* can't happen */
             return -EINVAL;
     }
-    if (newpos < 0) return -EINVAL;
     if (newpos >= vsd_dev->hwregs->dev_size)
         newpos = vsd_dev->hwregs->dev_size;
+    mutex_unlock(&vsd_dev->dev_ops_serialization_mutex);
+    if (newpos < 0) return -EINVAL;
 
     filp->f_pos = newpos;
     return newpos;
@@ -214,7 +233,9 @@ static long vsd_ioctl_get_size(vsd_ioctl_get_size_arg_t __user *uarg)
     if (copy_from_user(&arg, uarg, sizeof(arg)))
         return -EFAULT;
 
+    mutex_lock(&vsd_dev->dev_ops_serialization_mutex);
     arg.size = vsd_dev->hwregs->dev_size;
+    mutex_unlock(&vsd_dev->dev_ops_serialization_mutex);
 
     if (copy_to_user(uarg, &arg, sizeof(arg)))
         return -EFAULT;
@@ -224,7 +245,30 @@ static long vsd_ioctl_get_size(vsd_ioctl_get_size_arg_t __user *uarg)
 static long vsd_ioctl_set_size(vsd_ioctl_set_size_arg_t __user *uarg)
 {
     // TODO implement
-    return 0;
+    int ret = 0;
+    vsd_ioctl_set_size_arg_t arg;
+
+
+    if (copy_from_user(&arg, uarg, sizeof(arg))) return -EFAULT;
+
+    mutex_lock(&vsd_dev->dev_ops_serialization_mutex);
+    vsd_dev->hwregs->result = 0;
+    vsd_dev->hwregs->tasklet_vaddr =
+        (uint64_t)&vsd_dev->dma_op_complete_tsk;
+    vsd_dev->hwregs->dma_paddr = 0;
+    vsd_dev->hwregs->dma_size = 0;
+    vsd_dev->hwregs->dev_offset = arg.size;
+    wmb();
+    vsd_dev->hwregs->cmd = VSD_CMD_SET_SIZE;
+
+    wait_event(vsd_dev->dma_op_compete_wq,
+            vsd_dev->hwregs->cmd == VSD_CMD_NONE);
+
+    ret = vsd_dev->hwregs->result;
+    mutex_unlock(&vsd_dev->dev_ops_serialization_mutex);
+
+    print_vsd_dev_hw_regs(vsd_dev);
+    return ret;
 }
 
 static long vsd_dev_ioctl(struct file *filp, unsigned int cmd,

@@ -84,6 +84,23 @@ static void vsd_dev_set_size(size_t size)
     // Ensure that woken up task observes your writes
     // to shared memory (hwregs).
     // If new size is > current size then return -EINVAL.
+    int ret = 0;
+    struct tasklet_struct *comp_tasklet =
+        (struct tasklet_struct*)dev.hwregs->tasklet_vaddr;
+
+    if (size > dev.buf_size) ret = -EINVAL;
+    else if (size > dev.hwregs->dev_size) ret = -EINVAL;
+    else {
+        dev.hwregs->dev_size = size;
+        dev.buf_size = size;
+    } 
+
+    dev.hwregs->result = ret < 0 ? (int32_t)ret : 0;
+    wmb();
+    dev.hwregs->cmd = VSD_CMD_NONE;
+    if (comp_tasklet) {
+        tasklet_schedule(comp_tasklet);
+    }
 }
 
 static void vsd_dev_cmd_rw_after(ssize_t ret)
@@ -124,6 +141,7 @@ static int vsd_dev_cmd_poll_kthread_func(void *data)
             case VSD_CMD_SET_SIZE:
                 // TODO call vsd_dev_set_size
                 // with right arguments
+                vsd_dev_set_size((size_t)dev.hwregs->dev_offset);
                 break;
         }
 
